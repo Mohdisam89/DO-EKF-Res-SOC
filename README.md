@@ -188,21 +188,33 @@ pip install numpy pandas matplotlib scipy torch
 
 ---
 
-# Running the Code
+## NASA Battery Dataset
 
-```bash
-python bms_doekf_residual_lstm_synthetic_model_mismatch_complete.py
+This project does **not** include the NASA Battery Dataset due to licensing and repository size limitations.
+
+Before running any script, please download the dataset from the official NASA Prognostics Center of Excellence (PCoE) repository:
+
+**NASA PCoE Battery Dataset**
+https://www.nasa.gov/content/prognostics-center-of-excellence-data-set-repository/
+
+After downloading, organize the dataset as follows:
+
+```text
+NASA_Dataset/
+├── metadata.csv
+└── data/
+    ├── B0005.*
+    ├── B0006.*
+    ├── B0007.*
+    └── B0018.*
 ```
 
----
+The preprocessing pipeline must be executed in the following order:
 
-# Project Structure
-
-```
-bms_doekf_residual_lstm_synthetic_model_mismatch_complete.py
-README.md
-results/
-```
+1. `nasa_data_audit_before_training.py`
+2. `nasa_professional_data_preparation_before_training.py`
+3. `nasa_step1b_ocv_ecm_refinement_before_training.py`
+4. `bms_doekf_residual_lstm_nasa_complete.py`
 
 ---
 

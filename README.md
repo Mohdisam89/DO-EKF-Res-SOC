@@ -206,6 +206,5 @@ results/
 
 ---
 
-# Citation
-
-If you use this implementation in academic research, please cite the associated publication describing the Data-Optimized Extended Kalman Filter (DO-EKF) with Residual BiLSTM for lithium-ion battery State-of-Charge estimation.
+# Future Work
+The proposed DO-EKF_Res framework is currently under preparation for journal publication. Once the manuscript is accepted and published, the corresponding citation information will be added.

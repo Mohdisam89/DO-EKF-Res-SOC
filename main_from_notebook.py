@@ -26,7 +26,7 @@ DATA_DIR = DATASET_DIR / "data"
 
 BATTERY_IDS = ["B0005", "B0006", "B0007", "B0018"]
 
-# اجعلها 20 للفحص السريع، ثم None لفحص كل الدورات.
+# Set to 20 for a quick audit, or None to process all discharge cycles.
 MAX_CYCLES_PER_BATTERY = 20
 
 OUT_DIR = "nasa_data_audit_results"
@@ -2832,5 +2832,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

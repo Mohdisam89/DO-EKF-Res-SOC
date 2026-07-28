@@ -1,0 +1,1242 @@
+# bms_doekf_residual_lstm_synthetic_model_mismatch_complete.py
+# ============================================================
+# Synthetic SOC Estimation with controlled model mismatch: EKF, DO-EKF, DO-EKF_Res
+#
+#   SOC_final = SOC_DU + Residual_LSTM(...)
+#   Residual target = SOC_true - SOC_DU
+#
+# Split: 80% Monte Carlo scenarios for training, 20% for validation.
+# Run:   python bms_doekf_residual_lstm_synthetic_model_mismatch_complete.py
+# ============================================================
+
+import os, math, warnings
+from dataclasses import dataclass, field
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+try:
+    from scipy.stats import friedmanchisquare, wilcoxon, rankdata
+except Exception:
+    friedmanchisquare = wilcoxon = rankdata = None
+try:
+    from scipy.signal import savgol_filter
+except Exception:
+    savgol_filter = None
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 0. Configuration
+# ============================================================
+FAST_MODE = True
+
+if FAST_MODE:
+    N = 900
+    N_MC = 150
+    # Larger synthetic set for statistical analysis: 120 train / 30 validation.
+    # Longer DO-EKF training addresses slow convergence/underfitting.
+    DU_EPOCHS = 120
+    RES_EPOCHS = 60
+    QR_TRAIN_CASES = 20
+    HIDDEN = 64
+else:
+    N = 3600
+    N_MC = 200
+    DU_EPOCHS = 160
+    RES_EPOCHS = 180
+    QR_TRAIN_CASES = 30
+    HIDDEN = 96
+
+TRAIN_RATIO = 0.80
+DT = 1.0
+SEED = 42
+WINDOW = 100
+BATCH_SIZE = 256
+RESIDUAL_CLIP = 0.04
+# Initial prediction bound. It is updated dynamically after DO-EKF residuals are computed.
+PRED_CLIP = 0.035
+DYNAMIC_PRED_CLIP = True
+RESIDUAL_SMOOTH_WINDOW = 11
+RESIDUAL_MIN_ABS = 0.006
+RESIDUAL_IMPORTANCE_GAIN = 4.0
+USE_CONFIDENCE_GATE = True
+CONF_GATE_BETA = 60.0
+CONF_GATE_MIN_ALPHA = 0.10
+
+# Controlled synthetic model mismatch.
+# The data generator includes mild unmodelled voltage dynamics, while EKF/DO-EKF
+# use a biased first-order ECM. This emulates the model mismatch observed in NASA
+# data and gives residual learning a meaningful structured target.
+SYNTHETIC_MODEL_MISMATCH = True
+HYSTERESIS_GAIN = 0.014       # voltage term not represented in the EKF ECM
+OCV_WARP_GAIN = 0.010         # SOC-dependent OCV modelling error
+THERMAL_DRIFT_GAIN = 0.00025  # weak unmodelled thermal voltage drift
+
+# Hard-residual learning: train the residual network only on physically meaningful DO-EKF errors.
+# This prevents the BiLSTM from learning small high-frequency noise after DO-EKF convergence.
+HARD_RESIDUAL_MIN_ABS = 0.006      # 0.6% SOC; keeps only meaningful residual samples
+APPLY_RESIDUAL_MIN_ABS = 0.004     # 0.4% SOC; ignore tiny predicted corrections at inference
+RESIDUAL_CALIBRATION_RATIO = 0.15  # split from training scenarios for residual validation/calibration
+RESIDUAL_GAIN_GRID = np.linspace(0.0, 1.0, 21).astype(np.float32)
+
+# Live/progressive training plots are saved during training.
+LIVE_PLOT_EVERY = 1
+DU_PATIENCE = 25 if FAST_MODE else 35
+RES_PATIENCE = 15
+
+# Three-model comparison required for the paper
+# 1) EKF baseline
+# 2) DO-EKF with learned Q/R
+# 3) DO-EKF_Res Learning
+Q_EKF_BASE = np.diag([1e-6, 1e-7]).astype(np.float64)
+R_EKF_BASE = 1e-4
+
+OUT_DIR = "results_synthetic_DO-EKF_Res_model_mismatch_NMC150_gated_v2"
+os.makedirs(OUT_DIR, exist_ok=True)
+BASE_FEATURES = [
+    "Voltage_measured",
+    "Current_discharge",
+    "Temperature_measured",
+    "SOH",
+    "SOH_delta",
+    "time_norm",
+    "dV_dt",
+    "dI_dt",
+    "discharged_Ah",
+    "cumulative_Wh",
+    "R_dyn_approx",
+]
+
+RES_FEAT = BASE_FEATURES + ["SOC_DU", "V_EKF_pred", "V_EKF_error"]
+
+
+def set_seed(seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ============================================================
+# 1. Battery and ECM model
+# ============================================================
+@dataclass
+class BatteryParams:
+    Q_nom_ref: float = 2.0
+    T_ref: float = 25.0
+    R0_ref: float = 0.018
+    R1_ref: float = 0.012
+    C1_ref: float = 2500.0
+    kR0_age: float = 1.10
+    kR1_age: float = 0.80
+    kC1_age: float = 0.40
+    kQ_age: float = 1.15
+    kR0_lowT: float = 0.030
+    kR0_highT: float = 0.008
+    kR1_lowT: float = 0.025
+    kR1_highT: float = 0.006
+    kQ_lowT: float = 0.004
+    dOCV_dT: float = 0.00035
+    SOC_grid: np.ndarray = field(default_factory=lambda: np.array(
+        [0.00,0.03,0.05,0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80,0.90,1.00], dtype=np.float32))
+    OCV_grid: np.ndarray = field(default_factory=lambda: np.array(
+        [3.00,3.15,3.25,3.40,3.55,3.65,3.72,3.78,3.84,3.92,4.02,4.12,4.20], dtype=np.float32))
+
+    def ocv(self, soc):
+        return np.interp(np.clip(soc, 0.0, 1.0), self.SOC_grid, self.OCV_grid)
+
+    def ocv_with_T(self, soc, T):
+        return self.ocv(soc) + self.dOCV_dT * (T - self.T_ref)
+
+    def docv_dsoc(self, soc):
+        d = 1e-5
+        sp = min(0.999, float(soc) + d)
+        sm = max(0.001, float(soc) - d)
+        return float((self.ocv(sp) - self.ocv(sm)) / (sp - sm))
+
+
+def make_estimator_battery_params(true_params):
+    """
+    Create the biased ECM used by EKF/DO-EKF in the synthetic experiment.
+
+    The generator uses true_params, whereas the estimator uses this biased model.
+    This controlled mismatch is intentional: it creates structured residual errors
+    similar to those observed in real battery datasets such as NASA.
+    """
+    est = BatteryParams()
+    if not SYNTHETIC_MODEL_MISMATCH:
+        return est
+
+    est.R0_ref = true_params.R0_ref * 0.88
+    est.R1_ref = true_params.R1_ref * 1.18
+    est.C1_ref = true_params.C1_ref * 0.82
+    est.dOCV_dT = true_params.dOCV_dT * 0.65
+
+    # Mild smooth OCV bias: small enough to remain realistic, large enough to
+    # produce learnable residual structure.
+    soc = true_params.SOC_grid.astype(np.float64)
+    ocv_bias = 0.008 * np.sin(np.pi * soc) - 0.006 * (soc - 0.5)
+    est.SOC_grid = true_params.SOC_grid.copy()
+    est.OCV_grid = (true_params.OCV_grid.astype(np.float64) + ocv_bias).astype(np.float32)
+    return est
+
+
+@dataclass
+class ThermalParams:
+    Tamb_base: float = 25.0
+    Rth: float = 7.0
+    Cth: float = 420.0
+    cooling_noise: float = 0.002
+
+
+def ecm_params_np(bat, T, SOH):
+    dT_lo = max(0.0, bat.T_ref - T)
+    dT_hi = max(0.0, T - bat.T_ref)
+    R0m = (1 + bat.kR0_lowT*dT_lo - bat.kR0_highT*dT_hi) * (1 + bat.kR0_age*(1-SOH))
+    R1m = (1 + bat.kR1_lowT*dT_lo - bat.kR1_highT*dT_hi) * (1 + bat.kR1_age*(1-SOH))
+    C1m = max(0.55, 1 - bat.kC1_age*(1-SOH) - 0.003*dT_lo)
+    Qm  = max(0.60, SOH**bat.kQ_age * (1 - bat.kQ_lowT*dT_lo))
+    return {
+        "R0": float(np.clip(bat.R0_ref*R0m, 0.002, 0.090)),
+        "R1": float(np.clip(bat.R1_ref*R1m, 0.002, 0.090)),
+        "C1": float(np.clip(bat.C1_ref*C1m, 500.0, 8000.0)),
+        "Q_eff": float(np.clip(bat.Q_nom_ref*Qm, 0.5, bat.Q_nom_ref)),
+    }
+
+
+# ============================================================
+# 2. Synthetic data
+# ============================================================
+def generate_mc_data(N, dt, bat, th, seed, SOC0_nom=0.92, Vrc0=0.0,
+                     sig_soc_base=4e-5, sig_v_base=8e-3,
+                     sig_ibias=0.015, sig_vbias=0.006):
+    rng = np.random.default_rng(seed)
+    SOH0 = 0.82 + 0.17*rng.random()
+    dSOH = 0.001 + 0.004*rng.random()
+    SOH_v = np.linspace(SOH0, max(0.70, SOH0-dSOH), N).astype(np.float32)
+    SOC0 = float(np.clip(SOC0_nom + 0.04*rng.standard_normal(), 0.75, 0.98))
+    tidx = np.arange(N, dtype=np.float32)
+
+    I_base = (0.55 + 0.75*np.sin(2*np.pi*tidx/(500+200*rng.random()))
+              + 0.35*np.sin(2*np.pi*tidx/(70+60*rng.random()))
+              + 0.35*rng.standard_normal(N))
+    pulse = np.zeros(N, dtype=np.float32)
+    for _ in range(rng.integers(14, 29)):
+        st = rng.integers(0, N-120)
+        pw = rng.integers(30, 181)
+        amp = -1.2 + 4.0*rng.random()
+        pulse[st:min(N, st+pw)] += amp
+    I_true = np.clip(I_base + 0.35*pulse, -2.0, 4.0).astype(np.float32)
+    I_bias = sig_ibias*rng.standard_normal()
+    V_bias = sig_vbias*rng.standard_normal()
+    I_meas = (I_true + I_bias + 0.015*rng.standard_normal(N)).astype(np.float32)
+
+    amb_sh = -10 + 25*rng.random()
+    Tamb = (th.Tamb_base + amb_sh + 2.5*np.sin(2*np.pi*tidx/(N*(0.7+0.6*rng.random()))
+            + 2*np.pi*rng.random())).astype(np.float32)
+
+    SOC = np.zeros(N, dtype=np.float32)
+    Vrc = np.zeros(N, dtype=np.float32)
+    T = np.zeros(N, dtype=np.float32)
+    V_true = np.zeros(N, dtype=np.float32)
+    V_meas = np.zeros(N, dtype=np.float32)
+    SOC[0] = SOC0
+    Vrc[0] = Vrc0
+    T[0] = float(Tamb[0]) + rng.standard_normal()
+
+    for k in range(N-1):
+        prm = ecm_params_np(bat, float(T[k]), float(SOH_v[k]))
+        alpha = np.exp(-dt/(prm["R1"]*prm["C1"]))
+        sig_s = sig_soc_base*(1 + 2.0*(1-SOH_v[k]) + 0.04*max(0.0, 25-T[k]))
+        SOC[k+1] = np.clip(SOC[k] - dt/(prm["Q_eff"]*3600.0)*I_true[k]
+                            + sig_s*rng.standard_normal(), 0.01, 0.99)
+        Vrc[k+1] = alpha*Vrc[k] + (1-alpha)*prm["R1"]*I_true[k]
+        heat = I_true[k]**2 * prm["R0"]
+        dT_step = (dt/th.Cth)*(heat - (T[k]-Tamb[k])/th.Rth)
+        T[k+1] = np.clip(T[k] + dT_step + th.cooling_noise*rng.standard_normal(), -5.0, 60.0)
+
+    for k in range(N):
+        prm = ecm_params_np(bat, float(T[k]), float(SOH_v[k]))
+        ocv_T = bat.ocv(SOC[k]) + bat.dOCV_dT*(T[k]-bat.T_ref)
+
+        hidden_mismatch = 0.0
+        if SYNTHETIC_MODEL_MISMATCH:
+            aging_factor = 1.0 + 1.5 * (1.0 - float(SOH_v[k]))
+            hidden_mismatch = (
+                HYSTERESIS_GAIN * np.tanh(1.8 * float(I_true[k])) * aging_factor
+                + OCV_WARP_GAIN * np.sin(2.0 * np.pi * float(SOC[k])) * (1.0 - float(SOH_v[k]))
+                + THERMAL_DRIFT_GAIN * (float(T[k]) - bat.T_ref)
+            )
+
+        V_true[k] = ocv_T - prm["R0"]*I_true[k] - Vrc[k] + hidden_mismatch
+        sig_v = sig_v_base*(1 + 0.015*abs(T[k]-25) + 1.8*(1-SOH_v[k]))
+        V_meas[k] = V_true[k] + V_bias + sig_v*rng.standard_normal()
+
+    return {"SOC_true": SOC.astype(np.float32), "V_meas": V_meas.astype(np.float32),
+            "I_meas": I_meas.astype(np.float32), "T": T.astype(np.float32),
+            "Tamb": Tamb.astype(np.float32), "SOH_vec": SOH_v.astype(np.float32),
+            "V_true": V_true.astype(np.float32), "I_true": I_true.astype(np.float32)}
+
+
+def add_derived_features(D, dt=1.0):
+    """
+    Create the same feature family used in the NASA training code:
+      Voltage_measured, Current_discharge, Temperature_measured, SOH,
+      SOH_delta, time_norm, dV_dt, dI_dt, discharged_Ah, cumulative_Wh,
+      R_dyn_approx.
+
+    This keeps the simulation experiment mathematically consistent with
+    the NASA experiment. SOC and SOH are not redefined after this point.
+    """
+    I = D["I_meas"].astype(np.float64)
+    V = D["V_meas"].astype(np.float64)
+    T = D["T"].astype(np.float64)
+    SOH = D["SOH_vec"].astype(np.float64)
+    Nloc = len(I)
+
+    t = np.arange(Nloc, dtype=np.float64) * dt
+    time_norm = t / max(t[-1], 1e-12)
+
+    dV_dt = np.gradient(V, dt)
+    dI_dt = np.gradient(I, dt)
+
+    # NASA-prepared data uses positive discharge current.
+    # Synthetic current includes charge/discharge pulses, therefore cumulative Ah/Wh
+    # are generated from measured current directly for consistency with the filter dynamics.
+    discharged_Ah = np.cumsum(I * dt) / 3600.0
+    cumulative_Wh = np.cumsum(V * I * dt) / 3600.0
+
+    dV = np.gradient(V)
+    dI = np.gradient(I)
+    R_dyn = np.full_like(V, np.nan, dtype=np.float64)
+    valid = np.abs(dI) > 1e-4
+    R_dyn[valid] = -dV[valid] / dI[valid]
+    R_dyn = np.clip(R_dyn, -5.0, 5.0)
+    if np.any(np.isfinite(R_dyn)):
+        med = np.nanmedian(R_dyn)
+        R_dyn = np.where(np.isfinite(R_dyn), R_dyn, med)
+    else:
+        R_dyn = np.zeros_like(V)
+
+    out = dict(D)
+    out["Voltage_measured"] = V.astype(np.float32)
+    out["Current_discharge"] = I.astype(np.float32)
+    out["Temperature_measured"] = T.astype(np.float32)
+    out["SOH"] = SOH.astype(np.float32)
+    out["SOH_delta"] = (1.0 - SOH).astype(np.float32)
+    out["time_norm"] = time_norm.astype(np.float32)
+    out["dV_dt"] = dV_dt.astype(np.float32)
+    out["dI_dt"] = dI_dt.astype(np.float32)
+    out["discharged_Ah"] = discharged_Ah.astype(np.float32)
+    out["cumulative_Wh"] = cumulative_Wh.astype(np.float32)
+    out["R_dyn_approx"] = R_dyn.astype(np.float32)
+
+    # Backward-compatible aliases for any remaining plotting/legacy lines.
+    out["dV"] = out["dV_dt"]
+    out["dI"] = out["dI_dt"]
+    cc = discharged_Ah
+    out["cc"] = ((cc - cc.mean()) / (cc.std() + 1e-12)).astype(np.float32)
+    return out
+
+
+# ============================================================
+# 3. EKF / DO-EKF
+# ============================================================
+def run_ekf_np(I, Vmeas, T_arr, SOH_arr, bat, dt, Q, R, soc0, vrc0):
+    """
+    EKF equation aligned with the NASA code:
+      returns SOC estimate, EKF voltage prediction, and innovation.
+    """
+    n = len(I)
+    x = np.array([soc0, vrc0], dtype=np.float64)
+    P = np.diag([0.03, 0.003]).astype(np.float64)
+
+    soc_out = np.zeros(n, dtype=np.float64)
+    v_pred_out = np.zeros(n, dtype=np.float64)
+    innov_out = np.zeros(n, dtype=np.float64)
+
+    for k in range(n):
+        prm = ecm_params_np(bat, float(T_arr[k]), float(SOH_arr[k]))
+        dtk = float(dt)
+        if not np.isfinite(dtk) or dtk <= 0:
+            dtk = 1.0
+
+        alpha = np.exp(-dtk/(prm["R1"]*prm["C1"]))
+        F = np.array([[1.0, 0.0], [0.0, alpha]], dtype=np.float64)
+
+        xp = np.array([
+            np.clip(x[0] - dtk/(prm["Q_eff"]*3600.0)*float(I[k]), 0.01, 0.99),
+            alpha*x[1] + (1.0-alpha)*prm["R1"]*float(I[k])
+        ], dtype=np.float64)
+
+        Pp = F @ P @ F.T + Q
+
+        Vp = bat.ocv_with_T(xp[0], float(T_arr[k])) - prm["R0"]*float(I[k]) - xp[1]
+        H = np.array([[bat.docv_dsoc(xp[0]), -1.0]], dtype=np.float64)
+
+        S = float(H @ Pp @ H.T) + R + 1e-12
+        K = (Pp @ H.T) / S
+
+        innovation = float(Vmeas[k]) - Vp
+        x = xp + K.flatten()*innovation
+        x[0] = np.clip(x[0], 0.01, 0.99)
+
+        A = np.eye(2) - K @ H
+        P = A @ Pp @ A.T + K*R@K.T
+        P = 0.5*(P + P.T) + 1e-12*np.eye(2)
+
+        soc_out[k] = x[0]
+        v_pred_out[k] = Vp
+        innov_out[k] = innovation
+
+    return soc_out.astype(np.float32), v_pred_out.astype(np.float32), innov_out.astype(np.float32)
+
+
+def doekf_forward_np(I, Vmeas, T_arr, SOH_arr, bat, dt, lq_soc, lq_vrc, lr_, soc0, vrc0):
+    Q = np.diag([np.exp(lq_soc), np.exp(lq_vrc)]).astype(np.float64)
+    R = float(np.exp(lr_))
+    return run_ekf_np(I, Vmeas, T_arr, SOH_arr, bat, dt, Q, R, soc0, vrc0)[0]
+
+
+
+def plot_doekf_training_progress(hist, out_dir=OUT_DIR, filename="training_progress_doekf_live"):
+    if not hist:
+        return
+    H = pd.DataFrame(hist)
+    best_idx = int(H["val_rmse"].idxmin())
+    best_ep = int(H.loc[best_idx, "epoch"])
+    best_val = float(H.loc[best_idx, "val_rmse"])
+
+    fig, ax = plt.subplots(figsize=(6.8, 3.8))
+    ax.plot(H["epoch"], H["train_rmse"], marker="o", linewidth=1.8, label="Training RMSE")
+    ax.plot(H["epoch"], H["val_rmse"], marker="s", linewidth=1.8, label="Validation RMSE")
+    ax.axvline(best_ep, linestyle="--", linewidth=1.2, color="0.35", label=f"Best epoch = {best_ep}")
+    ax.scatter([best_ep], [best_val], s=55, color="black", zorder=5)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("RMSE (%)")
+    ax.set_title("DO-EKF Covariance Optimization")
+    ax.grid(True, linestyle="--", linewidth=0.6, alpha=0.55)
+    ax.legend(frameon=True, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"{filename}.png"), dpi=300, bbox_inches="tight")
+    fig.savefig(os.path.join(out_dir, f"{filename}.pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_residual_training_progress(hist, out_dir=OUT_DIR, filename="training_progress_residual_live"):
+    if not hist:
+        return
+    H = pd.DataFrame(hist)
+    best_idx = int(H["val_residual_rmse"].idxmin())
+    best_ep = int(H.loc[best_idx, "epoch"])
+    best_val = float(H.loc[best_idx, "val_residual_rmse"])
+
+    fig, ax1 = plt.subplots(figsize=(6.8, 3.8))
+    ax1.plot(H["epoch"], H["train_loss"], marker="o", linewidth=1.6, label="Training loss")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Training loss")
+    ax1.set_yscale("log")
+    ax1.grid(True, linestyle="--", linewidth=0.6, alpha=0.55)
+
+    ax2 = ax1.twinx()
+    ax2.plot(H["epoch"], H["val_residual_rmse"], marker="s", linewidth=1.8, label="Validation residual RMSE")
+    ax2.axvline(best_ep, linestyle="--", linewidth=1.2, color="0.35", label=f"Best epoch = {best_ep}")
+    ax2.scatter([best_ep], [best_val], s=55, color="black", zorder=5)
+    ax2.set_ylabel("Validation residual RMSE (%)")
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, frameon=True, fontsize=8, loc="upper right")
+    ax1.set_title("Residual BiLSTM Training")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"{filename}.png"), dpi=300, bbox_inches="tight")
+    fig.savefig(os.path.join(out_dir, f"{filename}.pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+def train_doekf_qr_multicase(train_cases, val_cases, bat, dt, soc0, vrc0,
+                             n_epochs=40, lr=0.035, patience=12, max_train_cases=12):
+    """
+    Train DO-EKF Q/R with longer optimization and live plots.
+
+    Main change for the underfitting issue:
+      - FAST_MODE now uses more epochs.
+      - Early stopping is based on validation RMSE.
+      - Training and validation curves are saved during training.
+    """
+    theta = np.array([-11.5, -16.1, -7.6], dtype=np.float64)
+    m_adam = np.zeros(3)
+    v_adam = np.zeros(3)
+    beta1, beta2, eps = 0.9, 0.999, 1e-8
+    delta = 1e-4
+
+    train_subset = train_cases[:min(max_train_cases, len(train_cases))]
+    val_subset = val_cases if len(val_cases) > 0 else train_subset[-max(1, len(train_subset)//4):]
+
+    best_val = np.inf
+    best_theta = theta.copy()
+    best_epoch = 0
+    bad = 0
+    hist = []
+
+    def mean_case_loss(cases, th):
+        return float(np.mean([
+            np.mean((doekf_forward_np(
+                D["I_meas"], D["V_meas"], D["T"], D["SOH_vec"],
+                bat, dt, *th, soc0, vrc0
+            ) - D["SOC_true"]) ** 2)
+            for D in cases
+        ]))
+
+    for ep in range(1, n_epochs + 1):
+        loss = mean_case_loss(train_subset, theta)
+
+        grad = np.zeros(3)
+        for p in range(3):
+            thp = theta.copy()
+            thp[p] += delta
+            grad[p] = (mean_case_loss(train_subset, thp) - loss) / delta
+
+        m_adam = beta1 * m_adam + (1 - beta1) * grad
+        v_adam = beta2 * v_adam + (1 - beta2) * (grad ** 2)
+        theta = theta - lr * (m_adam / (1 - beta1 ** ep)) / (np.sqrt(v_adam / (1 - beta2 ** ep)) + eps)
+
+        # Evaluate after the update so train/validation curves are comparable.
+        train_loss_eval = mean_case_loss(train_subset, theta)
+        val_loss = mean_case_loss(val_subset, theta)
+        train_rmse = math.sqrt(train_loss_eval) * 100
+        val_rmse = math.sqrt(val_loss) * 100
+
+        improved = val_rmse < (best_val - 1e-6)
+        if improved:
+            best_val = val_rmse
+            best_theta = theta.copy()
+            best_epoch = ep
+            bad = 0
+        else:
+            bad += 1
+
+        hist.append({
+            "epoch": ep,
+            "train_rmse": train_rmse,
+            "val_rmse": val_rmse,
+            "best_val_rmse": best_val,
+            "q_soc": float(np.exp(theta[0])),
+            "q_vrc": float(np.exp(theta[1])),
+            "r": float(np.exp(theta[2])),
+            "best_epoch": best_epoch,
+        })
+
+        if ep == 1 or ep % 5 == 0 or improved:
+            print(
+                f"DO-EKF Epoch {ep:03d}/{n_epochs} | "
+                f"Train RMSE={train_rmse:.4f}% | Val RMSE={val_rmse:.4f}% | "
+                f"Best={best_val:.4f}% @ {best_epoch}"
+            )
+
+        if ep % LIVE_PLOT_EVERY == 0:
+            plot_doekf_training_progress(hist)
+            pd.DataFrame(hist).to_csv(os.path.join(OUT_DIR, "doekf_training_history_live.csv"), index=False)
+
+        if bad >= patience:
+            print(f"DO-EKF early stopping at epoch {ep} | best epoch={best_epoch} | best Val RMSE={best_val:.4f}%")
+            break
+
+    hist_df = pd.DataFrame(hist)
+    hist_df.to_csv(os.path.join(OUT_DIR, "doekf_training_history.csv"), index=False)
+    plot_doekf_training_progress(hist)
+
+    if len(hist_df) >= 3 and best_epoch == int(hist_df["epoch"].iloc[-1]):
+        print("NOTE: DO-EKF validation RMSE was still improving at the last epoch. "
+              "Consider increasing DU_EPOCHS if more convergence is required.")
+
+    return best_theta, hist_df
+
+
+# ============================================================
+# 4. Residual windowed dataset and model
+# ============================================================
+def build_windows(Fn, length, window):
+    pad = np.tile(Fn[0:1], (window - 1, 1))
+    Fp = np.vstack([pad, Fn])
+    return np.stack([Fp[i:i+window] for i in range(length)], axis=0).astype(np.float32)
+
+
+def smooth_residual_target(r, window=RESIDUAL_SMOOTH_WINDOW):
+    """Low-pass residual target to reduce high-frequency noise before BiLSTM learning."""
+    r = np.asarray(r, dtype=np.float64)
+    if window is None or window <= 1 or len(r) < 5:
+        return r.astype(np.float32)
+    w = int(window)
+    if w % 2 == 0:
+        w += 1
+    w = min(w, len(r) if len(r) % 2 == 1 else len(r)-1)
+    if w < 5:
+        return r.astype(np.float32)
+    if savgol_filter is not None and w >= 5:
+        try:
+            return savgol_filter(r, window_length=w, polyorder=2, mode="interp").astype(np.float32)
+        except Exception:
+            pass
+    kernel = np.ones(w, dtype=np.float64) / w
+    return np.convolve(r, kernel, mode="same").astype(np.float32)
+
+
+def stack_residual_windowed_features(cases, feat_names, window, mu=None, sig=None,
+                                      return_weights=False, hard_mining=False,
+                                      min_abs=HARD_RESIDUAL_MIN_ABS):
+    """
+    Build BiLSTM residual-learning windows.
+
+    Updates for stable residual learning:
+      1) The residual target is smoothed to reduce high-frequency noise.
+      2) Training can use hard-residual mining, i.e., samples are retained only
+         when |SOC_true - SOC_DU| exceeds a physically meaningful threshold.
+      3) Larger residuals receive larger loss weights.
+
+    hard_mining should be True for residual training/validation and False for
+    full-sequence evaluation.
+    """
+    all_F = np.concatenate([np.vstack([D[f] for f in feat_names]).T for D in cases], axis=0)
+    if mu is None:
+        mu = all_F.mean(axis=0)
+        sig = all_F.std(axis=0)
+        sig[sig < 1e-12] = 1.0
+
+    Xw_list, Yres_list, W_list = [], [], []
+    kept_total, raw_total = 0, 0
+
+    for D in cases:
+        F = np.vstack([D[f] for f in feat_names]).T
+        Fn = (F - mu) / sig
+
+        residual_raw = np.clip(D["SOC_true"] - D["SOC_DU"], -RESIDUAL_CLIP, RESIDUAL_CLIP).astype(np.float32)
+        residual = smooth_residual_target(residual_raw)
+        residual = np.clip(residual, -RESIDUAL_CLIP, RESIDUAL_CLIP).astype(np.float32)
+
+        Xfull = build_windows(Fn, len(residual), window)
+
+        if hard_mining:
+            mask = np.abs(residual_raw) >= float(min_abs)
+            # Safety fallback: if a scenario has very few hard samples, keep the top 10% by residual magnitude.
+            if mask.sum() < max(20, int(0.03 * len(mask))):
+                thr = np.percentile(np.abs(residual_raw), 90)
+                mask = np.abs(residual_raw) >= thr
+        else:
+            mask = np.ones(len(residual), dtype=bool)
+
+        # Emphasise large residuals smoothly instead of treating all retained samples equally.
+        weights = 1.0 + RESIDUAL_IMPORTANCE_GAIN * np.minimum(np.abs(residual_raw) / max(min_abs, 1e-12), 3.0)
+        weights = weights.astype(np.float32)
+
+        Xw_list.append(Xfull[mask])
+        Yres_list.append(residual[mask])
+        W_list.append(weights[mask])
+        kept_total += int(mask.sum())
+        raw_total += int(len(mask))
+
+    X = np.concatenate(Xw_list).astype(np.float32)
+    Y = np.concatenate(Yres_list).astype(np.float32)
+    W = np.concatenate(W_list).astype(np.float32)
+
+    mode = "hard-mined" if hard_mining else "full"
+    print(f"Residual dataset mode={mode}: kept {kept_total}/{raw_total} samples ({100*kept_total/max(raw_total,1):.1f}%)")
+
+    if return_weights:
+        return X, Y, W, mu, sig
+    return X, Y, mu, sig
+
+
+class AttentionLayer(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attn = nn.Linear(hidden_size, 1)
+    def forward(self, lstm_out):
+        weights = torch.softmax(self.attn(lstm_out), dim=1)
+        return (lstm_out * weights).sum(dim=1)
+
+
+class ResidualBiLSTMNet(nn.Module):
+    def __init__(self, n_feat=8, hidden=64, n_layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(n_feat, hidden, num_layers=n_layers, batch_first=True,
+                            bidirectional=True, dropout=0.15 if n_layers > 1 else 0.0)
+        self.attention = AttentionLayer(hidden * 2)
+        self.fc = nn.Sequential(nn.Linear(hidden*2, 32), nn.ReLU(), nn.Dropout(0.10),
+                                nn.Linear(32, 1), nn.Tanh())
+    def forward(self, x):
+        o, _ = self.lstm(x)
+        ctx = self.attention(o)
+        return self.fc(ctx).squeeze(-1) * PRED_CLIP
+
+
+def train_residual_net(net, Xtr, Ytr, Xvl, Yvl, epochs, lr, device,
+                       batch_size=BATCH_SIZE, patience=15, Wtr=None, Wvl=None):
+    """Train residual BiLSTM using weighted SmoothL1 loss and live validation curves."""
+    net.to(device)
+    opt = optim.Adam(net.parameters(), lr=lr, weight_decay=2e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5, factor=0.5, min_lr=1e-5)
+    crit = nn.SmoothL1Loss(beta=0.005, reduction="none")
+
+    if Wtr is None:
+        Wtr = np.ones_like(Ytr, dtype=np.float32)
+    if Wvl is None:
+        Wvl = np.ones_like(Yvl, dtype=np.float32)
+
+    train_ds = TensorDataset(
+        torch.tensor(Xtr, dtype=torch.float32),
+        torch.tensor(Ytr, dtype=torch.float32),
+        torch.tensor(Wtr, dtype=torch.float32),
+    )
+    loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+
+    xvl = torch.tensor(Xvl, dtype=torch.float32, device=device)
+    yvl = torch.tensor(Yvl, dtype=torch.float32, device=device)
+    wvl = torch.tensor(Wvl, dtype=torch.float32, device=device)
+
+    best_val = np.inf
+    best_state = None
+    best_epoch = 0
+    bad = 0
+    hist = []
+
+    for ep in range(1, epochs + 1):
+        net.train()
+        total = 0.0
+        for xb, yb, wb in loader:
+            xb, yb, wb = xb.to(device), yb.to(device), wb.to(device)
+            opt.zero_grad(set_to_none=True)
+            pred = net(xb)
+            loss_vec = crit(pred, yb)
+            loss = (loss_vec * wb).mean()
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step()
+            total += loss.item()
+
+        train_loss = total / max(1, len(loader))
+        net.eval()
+        with torch.no_grad():
+            pred_v = net(xvl)
+            val_rmse = torch.sqrt(torch.mean((pred_v - yvl) ** 2)).item() * 100
+            val_wrmse = torch.sqrt(torch.sum(wvl * (pred_v - yvl) ** 2) / torch.sum(wvl)).item() * 100
+
+        scheduler.step(val_rmse)
+        current_lr = opt.param_groups[0]["lr"]
+        hist.append({
+            "epoch": ep,
+            "train_loss": train_loss,
+            "val_residual_rmse": val_rmse,
+            "val_weighted_residual_rmse": val_wrmse,
+            "lr": current_lr,
+            "best_epoch": best_epoch,
+        })
+
+        if val_rmse < best_val - 1e-5:
+            best_val = val_rmse
+            best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+            best_epoch = ep
+            bad = 0
+        else:
+            bad += 1
+
+        if ep % LIVE_PLOT_EVERY == 0:
+            plot_residual_training_progress(hist)
+            pd.DataFrame(hist).to_csv(os.path.join(OUT_DIR, "residual_training_history_live.csv"), index=False)
+
+        if ep == 1 or ep % 5 == 0 or bad == 0:
+            print(
+                f"Residual Epoch {ep:03d}/{epochs} | "
+                f"Train loss={train_loss:.6e} | Val residual RMSE={val_rmse:.4f}% | "
+                f"Best={best_val:.4f}% @ {best_epoch} | LR={current_lr:.1e}"
+            )
+
+        if bad >= patience:
+            print(f"Residual early stopping at epoch {ep} | best epoch={best_epoch} | best Val RMSE={best_val:.4f}%")
+            break
+
+    if best_state is not None:
+        net.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+
+    hist_df = pd.DataFrame(hist)
+    hist_df.to_csv(os.path.join(OUT_DIR, "residual_training_history.csv"), index=False)
+    plot_residual_training_progress(hist)
+    return net, hist_df
+
+def predict_residual_sequence(net, D, feat_names, mu, sig, window, device):
+    F = np.vstack([D[f] for f in feat_names]).T
+    Fn = (F - mu) / sig
+    Xw = build_windows(Fn, len(D["SOC_true"]), window)
+    net.eval()
+    with torch.no_grad():
+        res = net(torch.tensor(Xw, dtype=torch.float32, device=device)).cpu().numpy()
+    return np.clip(res, -PRED_CLIP, PRED_CLIP)
+
+
+def confidence_gate(residual, beta=CONF_GATE_BETA, min_alpha=CONF_GATE_MIN_ALPHA):
+    """
+    Sigmoid confidence-guided residual scaling.
+
+    Corrections below approximately 0.7% SOC are retained with high confidence,
+    whereas larger corrections are progressively down-weighted to reduce harmful
+    residual overshoot in scenarios where DO-EKF is already accurate.
+    """
+    residual = np.asarray(residual, dtype=np.float32)
+    alpha = 1.0 / (1.0 + np.exp(beta * (np.abs(residual) - 0.007)))
+    return np.clip(alpha, min_alpha, 1.0).astype(np.float32)
+
+
+def apply_residual_correction(du, res_pred_raw, gain=1.0):
+    """Apply thresholded confidence-guided residual correction."""
+    if USE_CONFIDENCE_GATE:
+        alpha = confidence_gate(res_pred_raw)
+    else:
+        alpha = np.ones_like(res_pred_raw, dtype=np.float32)
+
+    # Ignore tiny predicted corrections, which are usually noise-dominated.
+    active = np.abs(res_pred_raw) >= APPLY_RESIDUAL_MIN_ABS
+    res_pred = np.where(active, gain * alpha * res_pred_raw, 0.0).astype(np.float32)
+    soc_final = np.clip(du + res_pred, 0.01, 0.99).astype(np.float32)
+    return soc_final, res_pred, alpha, active
+
+
+def calibrate_residual_gain(net, calib_cases, feat_names, mu, sig, window, device,
+                            gain_grid=RESIDUAL_GAIN_GRID):
+    """
+    Select a conservative scalar gain for the residual branch using only training-side
+    calibration scenarios. This prevents the residual network from degrading DO-EKF
+    when the predicted correction is uncertain.
+    """
+    rows = []
+    best_gain, best_rmse = 0.0, np.inf
+
+    for g in gain_grid:
+        rmses = []
+        improved_count = 0
+        for D in calib_cases:
+            du = D["SOC_DU"]
+            res_raw = predict_residual_sequence(net, D, feat_names, mu, sig, window, device)
+            soc_corr, _, _, _ = apply_residual_correction(du, res_raw, gain=float(g))
+            rmse_corr = compute_metrics(soc_corr, D["SOC_true"])["RMSE"]
+            rmse_du = compute_metrics(du, D["SOC_true"])["RMSE"]
+            rmses.append(rmse_corr)
+            if rmse_corr < rmse_du:
+                improved_count += 1
+        mean_rmse = float(np.mean(rmses))
+        rows.append({
+            "gain": float(g),
+            "calibration_RMSE_mean": mean_rmse,
+            "calibration_RMSE_std": float(np.std(rmses, ddof=1)) if len(rmses) > 1 else 0.0,
+            "improved_cases": improved_count,
+            "n_cases": len(calib_cases),
+        })
+        if mean_rmse < best_rmse:
+            best_rmse = mean_rmse
+            best_gain = float(g)
+
+    gain_df = pd.DataFrame(rows)
+    gain_df.to_csv(os.path.join(OUT_DIR, "residual_gain_calibration.csv"), index=False)
+    print(f"Selected residual correction gain = {best_gain:.2f} | calibration RMSE={best_rmse*100:.4f}%")
+    return best_gain, gain_df
+
+# ============================================================
+# 5. Metrics and plots
+# ============================================================
+def compute_metrics(est, true):
+    e = np.asarray(est) - np.asarray(true)
+    return {
+        "RMSE": float(np.sqrt(np.mean(e**2))),
+        "MAE": float(np.mean(np.abs(e)))
+    }
+
+
+def plot_training_history(hist):
+    fig, ax = plt.subplots(figsize=(7,4))
+    ax.plot(hist["epoch"], hist["val_residual_rmse"], label="Validation residual RMSE")
+    ax.set_xlabel("Epoch"); ax.set_ylabel("Residual RMSE (%)")
+    ax.set_title("Residual BiLSTM Training History")
+    ax.grid(alpha=0.3); ax.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "residual_training_history.png"), dpi=250, bbox_inches="tight")
+    plt.savefig(os.path.join(OUT_DIR, "residual_training_history.pdf"), dpi=250, bbox_inches="tight")
+    plt.close()
+
+
+def plot_soc_example(D, ekf, du, residual, DO-EKF_res):
+    t = np.arange(len(D["SOC_true"])) * DT / 3600.0
+    fig, ax = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+
+    ax[0].plot(t, D["SOC_true"]*100, "k", lw=2, label="True SOC")
+    ax[0].plot(t, ekf*100, ":", lw=1.2, label="EKF")
+    ax[0].plot(t, du*100, "--", lw=1.2, label="DO-EKF")
+    ax[0].plot(t, DO-EKF_res*100, "-.", lw=1.4, label="Proposed: DO-EKF + Residual")
+    ax[0].set_ylabel("SOC (%)")
+    ax[0].grid(alpha=0.3)
+    ax[0].legend(fontsize=8)
+
+    ax[1].plot(t, (ekf-D["SOC_true"])*100, ":", label="EKF Error")
+    ax[1].plot(t, (du-D["SOC_true"])*100, "--", label="DO-EKF Error")
+    ax[1].plot(t, (DO-EKF_res-D["SOC_true"])*100, "-.", label="Proposed Error")
+    ax[1].axhline(0, color="k", lw=0.8)
+    ax[1].set_ylabel("Error (%)")
+    ax[1].grid(alpha=0.3)
+    ax[1].legend(fontsize=8)
+
+    ax[2].plot(t, residual*100, lw=1.2, label="Predicted residual")
+    ax[2].axhline(0, color="k", lw=0.8)
+    ax[2].set_xlabel("Time (h)")
+    ax[2].set_ylabel("Residual (%)")
+    ax[2].grid(alpha=0.3)
+    ax[2].legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "synthetic_3models_soc_example.png"), dpi=250, bbox_inches="tight")
+    plt.savefig(os.path.join(OUT_DIR, "synthetic_3models_soc_example.pdf"), dpi=250, bbox_inches="tight")
+    plt.close()
+
+
+def print_three_model_table(summary_long):
+    print("\n"+"═"*60)
+    print(f'{"Method":<20} {"RMSE%":>10} {"Std%":>10} {"MAE%":>10}')
+    print("─"*60)
+    for _, r in summary_long.iterrows():
+        print(f'{r["Method"]:<20} {r["RMSE_mean"]*100:>9.4f}% {r["RMSE_std"]*100:>9.4f}% {r["MAE_mean"]*100:>9.4f}%')
+    print("═"*60)
+
+def plot_three_model_bar(summary_long):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(summary_long["Method"], summary_long["RMSE_mean"]*100)
+    ax.set_ylabel("Mean RMSE (%)")
+    ax.set_title("Synthetic Validation: EKF vs DO-EKF vs Proposed")
+    ax.grid(axis="y", alpha=0.3)
+    plt.xticks(rotation=15, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "synthetic_3models_rmse_bar.png"), dpi=250, bbox_inches="tight")
+    plt.savefig(os.path.join(OUT_DIR, "synthetic_3models_rmse_bar.pdf"), dpi=250, bbox_inches="tight")
+    plt.close()
+
+
+
+# ============================================================
+# 6. Statistical analysis and comparison plots
+# ============================================================
+def holm_bonferroni(pvalues, alpha=0.05):
+    pvalues = np.asarray(pvalues, dtype=float)
+    m = len(pvalues)
+    order = np.argsort(pvalues)
+    adjusted_sorted = np.empty(m, dtype=float)
+    running_max = 0.0
+    for rank_pos, idx in enumerate(order):
+        adj = (m - rank_pos) * pvalues[idx]
+        running_max = max(running_max, adj)
+        adjusted_sorted[rank_pos] = min(running_max, 1.0)
+    adjusted = np.empty(m, dtype=float)
+    adjusted[order] = adjusted_sorted
+    reject = adjusted <= alpha
+    return reject, adjusted
+
+
+def rank_biserial_from_diff(diff):
+    diff = np.asarray(diff, dtype=float)
+    diff = diff[diff != 0]
+    if len(diff) == 0 or rankdata is None:
+        return np.nan
+    ranks = rankdata(np.abs(diff))
+    w_pos = ranks[diff > 0].sum()
+    w_neg = ranks[diff < 0].sum()
+    denom = w_pos + w_neg
+    return float((w_pos - w_neg) / denom) if denom > 0 else np.nan
+
+
+def run_statistical_analysis(metrics_long, out_dir=OUT_DIR):
+    if friedmanchisquare is None or wilcoxon is None or rankdata is None:
+        print("SciPy is required for statistical analysis. Skipping statistical tests.")
+        return None, None, None
+
+    wide = metrics_long.pivot(index="scenario_local_index", columns="Method", values="RMSE")
+    wide = wide[["EKF", "DO-EKF", "DO-EKF_Res"]].dropna()
+    models = list(wide.columns)
+    n = len(wide)
+    k = len(models)
+
+    stat, pval = friedmanchisquare(wide["EKF"], wide["DO-EKF"], wide["DO-EKF_Res"])
+    ranks = np.array([rankdata(row, method="average") for row in wide.values])  # lower RMSE = lower rank
+    avg_ranks = ranks.mean(axis=0)
+    rank_sums = ranks.sum(axis=0)
+
+    friedman_df = pd.DataFrame({
+        "Test": ["Friedman"],
+        "Chi_square": [stat],
+        "p_value": [pval],
+        "n_units": [n],
+        "k_models": [k],
+    })
+    ranks_df = pd.DataFrame({"Method": models, "Average_Rank": avg_ranks, "Rank_Sum": rank_sums})
+    ranks_df = ranks_df.sort_values("Average_Rank")
+
+    pairs = [("EKF", "DO-EKF"), ("EKF", "DO-EKF_Res"), ("DO-EKF", "DO-EKF_Res")]
+    raw_p = []
+    rows = []
+    for a, b in pairs:
+        # paired difference: positive means b has lower RMSE than a
+        diff = wide[a].values - wide[b].values
+        try:
+            w_stat, p_raw = wilcoxon(wide[a], wide[b], zero_method="wilcox", alternative="two-sided")
+        except ValueError:
+            w_stat, p_raw = np.nan, 1.0
+        raw_p.append(p_raw)
+        rows.append({
+            "Comparison": f"{a} vs {b}",
+            "Mean_RMSE_A_%": float(wide[a].mean() * 100),
+            "Mean_RMSE_B_%": float(wide[b].mean() * 100),
+            "Mean_Difference_A_minus_B_%": float(diff.mean() * 100),
+            "Wilcoxon_W": float(w_stat) if np.isfinite(w_stat) else np.nan,
+            "Raw_p": float(p_raw),
+            "Rank_Biserial_r": rank_biserial_from_diff(diff),
+        })
+
+    reject, p_adj = holm_bonferroni(raw_p, alpha=0.05)
+    for i in range(len(rows)):
+        rows[i]["Holm_Adjusted_p"] = float(p_adj[i])
+        rows[i]["Significant_0.05"] = bool(reject[i])
+
+    pairwise_df = pd.DataFrame(rows)
+
+    friedman_df.to_csv(os.path.join(out_dir, "stat_friedman_results.csv"), index=False)
+    ranks_df.to_csv(os.path.join(out_dir, "stat_average_ranks.csv"), index=False)
+    pairwise_df.to_csv(os.path.join(out_dir, "stat_pairwise_wilcoxon_holm.csv"), index=False)
+
+    print("\n" + "═" * 86)
+    print("Statistical Analysis on Synthetic Validation RMSE")
+    print("═" * 86)
+    print(f"Friedman chi-square = {stat:.4f} | p = {pval:.6f}")
+    print("\nAverage ranks: lower is better")
+    print(ranks_df.to_string(index=False, float_format="%.4f"))
+    print("\nPairwise Wilcoxon-Holm results")
+    print(pairwise_df.to_string(index=False, float_format="%.6f"))
+
+    return friedman_df, ranks_df, pairwise_df
+
+# ============================================================
+# 6. Main
+# ============================================================
+def main():
+    print("\n" + "█"*76)
+    print(f" Synthetic Battery SOC | Three Models | {round(TRAIN_RATIO*100)}/{round((1-TRAIN_RATIO)*100)} Split")
+    print("█"*76)
+    set_seed(SEED); device = get_device()
+    print(f"Device: {device}")
+    print(f"FAST_MODE={FAST_MODE}")
+    print(f"N={N} | N_MC={N_MC} | TRAIN_RATIO={TRAIN_RATIO:.2f} | WINDOW={WINDOW}")
+    bat_true = BatteryParams()
+    bat = make_estimator_battery_params(bat_true)
+    th = ThermalParams()
+    print(f"Synthetic model mismatch: {SYNTHETIC_MODEL_MISMATCH}")
+    if SYNTHETIC_MODEL_MISMATCH:
+        print(f"True ECM refs: R0={bat_true.R0_ref:.4f}, R1={bat_true.R1_ref:.4f}, C1={bat_true.C1_ref:.1f}")
+        print(f"Estimator ECM refs: R0={bat.R0_ref:.4f}, R1={bat.R1_ref:.4f}, C1={bat.C1_ref:.1f}")
+
+    print("\nGenerating Monte Carlo scenarios...")
+    cases = [generate_mc_data(N, DT, bat_true, th, seed=1000+i) for i in range(N_MC)]
+    cases = [add_derived_features(D, DT) for D in cases]
+    print("Data generation completed.")
+
+    rng = np.random.default_rng(SEED)
+    idx = np.arange(N_MC); rng.shuffle(idx)
+    n_train = int(round(TRAIN_RATIO*N_MC))
+    train_cases = [cases[i] for i in idx[:n_train]]
+    val_cases = [cases[i] for i in idx[n_train:]]
+    print(f"\nTrain scenarios: {len(train_cases)}")
+    print(f"Validation scenarios: {len(val_cases)}")
+
+    print("\nTraining DO-EKF Q/R...")
+    n_du_val = max(1, int(round(0.2*len(train_cases))))
+    du_train_cases = train_cases[:-n_du_val]
+    du_val_cases = train_cases[-n_du_val:]
+    soc0_est, vrc0_est = 0.75, 0.0
+    theta, doekf_hist = train_doekf_qr_multicase(
+        du_train_cases, du_val_cases, bat, DT, soc0_est, vrc0_est,
+        n_epochs=DU_EPOCHS, lr=0.035, patience=DU_PATIENCE,
+        max_train_cases=QR_TRAIN_CASES
+    )
+    Q_du = np.diag([np.exp(theta[0]), np.exp(theta[1])]).astype(np.float64)
+    R_du = float(np.exp(theta[2]))
+    print(f"Learned Q = diag([{Q_du[0,0]:.3e}, {Q_du[1,1]:.3e}])")
+    print(f"Learned R = {R_du:.3e}")
+
+    def add_du(D):
+        DD = dict(D)
+        soc_du, v_pred, innov = run_ekf_np(D["I_meas"], D["V_meas"], D["T"], D["SOH_vec"],
+                                  bat, DT, Q_du, R_du, soc0_est, vrc0_est)
+        DD["SOC_DU"] = soc_du
+        DD["V_EKF_pred"] = v_pred
+        DD["V_EKF_error"] = innov
+        return DD
+
+    train_cases = [add_du(D) for D in train_cases]
+    val_cases = [add_du(D) for D in val_cases]
+
+    print("\nPreparing residual LSTM datasets...")
+    # Use a training-side split for residual validation and gain calibration.
+    # The final validation scenarios remain untouched until final model comparison.
+    n_res_cal = max(1, int(round(RESIDUAL_CALIBRATION_RATIO * len(train_cases))))
+    res_train_cases = train_cases[:-n_res_cal]
+    res_calib_cases = train_cases[-n_res_cal:]
+    print(f"Residual train scenarios: {len(res_train_cases)}")
+    print(f"Residual calibration scenarios: {len(res_calib_cases)}")
+
+    Xtr, Ytr, Wtr, mu, sig = stack_residual_windowed_features(
+        res_train_cases, RES_FEAT, WINDOW, return_weights=True, hard_mining=True,
+        min_abs=HARD_RESIDUAL_MIN_ABS
+    )
+    Xrv, Yrv, Wrv, _, _ = stack_residual_windowed_features(
+        res_calib_cases, RES_FEAT, WINDOW, mu, sig, return_weights=True, hard_mining=True,
+        min_abs=HARD_RESIDUAL_MIN_ABS
+    )
+    print(f"X_train residual: {Xtr.shape} | Y_train residual: {Ytr.shape}")
+    print(f"X_resval residual: {Xrv.shape} | Y_resval residual: {Yrv.shape}")
+
+    global PRED_CLIP
+    if DYNAMIC_PRED_CLIP:
+        raw_train_res = np.concatenate([
+            np.clip(D["SOC_true"] - D["SOC_DU"], -RESIDUAL_CLIP, RESIDUAL_CLIP)
+            for D in res_train_cases
+        ])
+        # Conservative residual bound: the residual branch corrects meaningful errors only.
+        PRED_CLIP = float(np.clip(1.5 * np.std(raw_train_res), 0.006, 0.010))
+    print(f"Dynamic residual prediction clip PRED_CLIP = {PRED_CLIP:.5f} ({PRED_CLIP*100:.2f}%)")
+
+    print("\nTraining Residual BiLSTM with hard-residual mining...")
+    residual_model = ResidualBiLSTMNet(n_feat=len(RES_FEAT), hidden=HIDDEN, n_layers=2)
+    residual_model, hist = train_residual_net(
+        residual_model, Xtr, Ytr, Xrv, Yrv,
+        epochs=RES_EPOCHS, lr=2e-4, device=device,
+        batch_size=BATCH_SIZE, patience=RES_PATIENCE,
+        Wtr=Wtr, Wvl=Wrv
+    )
+    hist.to_csv(os.path.join(OUT_DIR, "residual_training_history.csv"), index=False)
+    plot_training_history(hist)
+
+    print("\nCalibrating residual correction gain on training-side calibration scenarios...")
+    residual_gain, gain_df = calibrate_residual_gain(
+        residual_model, res_calib_cases, RES_FEAT, mu, sig, WINDOW, device
+    )
+
+    print("\nEvaluating validation scenarios using only the three paper models...")
+    rows = []
+    metric_rows = []
+    first_example = None
+
+    for local_i, D in enumerate(val_cases):
+        ekf, _, _ = run_ekf_np(
+            D["I_meas"], D["V_meas"], D["T"], D["SOH_vec"],
+            bat, DT, Q_EKF_BASE, R_EKF_BASE, soc0_est, vrc0_est
+        )
+
+        du = D["SOC_DU"]
+
+        # NASA-matched equation:
+        #   residual = network(features)
+        #   DO-EKF_Res = SOC_DU + residual
+        # Apply confidence-guided, thresholded, and calibrated residual correction.
+        res_pred_raw = predict_residual_sequence(
+            residual_model, D, RES_FEAT, mu, sig, WINDOW, device
+        )
+        DO-EKF_res, res_pred, alpha, active_mask = apply_residual_correction(
+            du, res_pred_raw, gain=residual_gain
+        )
+
+        m_ekf = compute_metrics(ekf, D["SOC_true"])
+        m_du = compute_metrics(du, D["SOC_true"])
+        m_res = compute_metrics(DO-EKF_res, D["SOC_true"])
+
+        rows.append({
+            "scenario_local_index": local_i,
+            "EKF_RMSE": m_ekf["RMSE"],
+            "EKF_MAE": m_ekf["MAE"],
+            "DU_RMSE": m_du["RMSE"],
+            "DU_MAE": m_du["MAE"],
+            "DO-EKF_Res_RMSE": m_res["RMSE"],
+            "DO-EKF_Res_MAE": m_res["MAE"],
+            "Mean_abs_residual_pred": float(np.mean(np.abs(res_pred))),
+            "Max_abs_residual_pred": float(np.max(np.abs(res_pred))),
+            "Mean_alpha": float(np.mean(alpha)),
+            "Residual_gain": float(residual_gain),
+            "Active_correction_fraction": float(np.mean(active_mask)),
+        })
+
+        for method, mm in [
+            ("EKF", m_ekf),
+            ("DO-EKF", m_du),
+            ("DO-EKF_Res", m_res),
+        ]:
+            metric_rows.append({
+                "scenario_local_index": local_i,
+                "Method": method,
+                "RMSE": mm["RMSE"],
+                "MAE": mm["MAE"],
+            })
+
+        print(
+            f"Val {local_i+1:02d}/{len(val_cases)} | "
+            f"EKF={m_ekf['RMSE']*100:.4f}% | "
+            f"DO-EKF={m_du['RMSE']*100:.4f}% | "
+            f"DO-EKF_Res={m_res['RMSE']*100:.4f}% | "
+            f"Mean|res|={np.mean(np.abs(res_pred))*100:.4f}%"
+        )
+
+        if first_example is None:
+            first_example = (D, ekf, du, res_pred, DO-EKF_res)
+
+    results = pd.DataFrame(rows)
+    metrics_long = pd.DataFrame(metric_rows)
+
+    summary_long = (
+        metrics_long.groupby("Method")
+        .agg(
+            RMSE_mean=("RMSE","mean"),
+            RMSE_std=("RMSE","std"),
+            MAE_mean=("MAE","mean"),
+        )
+        .reset_index()
+    )
+
+    order = {"EKF": 0, "DO-EKF": 1, "DO-EKF_Res": 2}
+    summary_long["order"] = summary_long["Method"].map(order)
+    summary_long = summary_long.sort_values("order").drop(columns="order")
+
+    results.to_csv(os.path.join(OUT_DIR, "synthetic_3models_validation_results_wide.csv"), index=False)
+    metrics_long.to_csv(os.path.join(OUT_DIR, "synthetic_3models_validation_metrics_long.csv"), index=False)
+    summary_long.to_csv(os.path.join(OUT_DIR, "synthetic_3models_summary.csv"), index=False)
+
+    print_three_model_table(summary_long)
+
+    try:
+        ekf_rmse = float(summary_long.loc[summary_long["Method"] == "EKF", "RMSE_mean"].iloc[0])
+        du_rmse = float(summary_long.loc[summary_long["Method"] == "DO-EKF", "RMSE_mean"].iloc[0])
+        res_rmse = float(summary_long.loc[summary_long["Method"] == "DO-EKF_Res", "RMSE_mean"].iloc[0])
+
+        print(f"\nImprovement of DO-EKF_Res over EKF   : {(ekf_rmse-res_rmse)/ekf_rmse*100:.2f}%")
+        print(f"Improvement of DO-EKF_Res over DO-EKF: {(du_rmse-res_rmse)/du_rmse*100:.2f}%")
+    except Exception:
+        pass
+
+    if first_example is not None:
+        plot_soc_example(*first_example)
+
+    plot_three_model_bar(summary_long)
+    run_statistical_analysis(metrics_long, OUT_DIR)
+
+    print(f"\nSaved results in: {OUT_DIR}")
+    print("Synthetic three-model experiment completed.")
+    return residual_model, summary_long, metrics_long, hist, doekf_hist
+
+
+if __name__ == "__main__":
+    residual_model, summary, results, hist, doekf_hist = main()
